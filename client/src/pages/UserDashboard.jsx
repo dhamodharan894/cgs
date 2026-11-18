@@ -2448,7 +2448,11 @@ export default function UserDashboard() {
                   Attendance Marked Absent & Locked
                 </h3>
                 <p className="text-xs text-text-sec mb-4 leading-relaxed font-semibold">
-                  You did not acknowledge an assigned task within 10 minutes. Your attendance has been marked <strong className="text-red-500">Absent</strong> and check-in is locked for today.
+                  {todayLog?.penalty_status === "missed_hourly_report_penalty"
+                    ? <>You missed submitting the required task progress report. Your attendance has been marked <strong className="text-red-500">Absent</strong> and check-in is locked for today.</>
+                    : todayLog?.penalty_status === "unseen_task_penalty"
+                    ? <>You did not acknowledge an assigned task within 10 minutes. Your attendance has been marked <strong className="text-red-500">Absent</strong> and check-in is locked for today.</>
+                    : <>Your attendance has been marked <strong className="text-red-500">Absent</strong> and check-in is locked for today.</>}
                 </p>
                 {todayLog?.penalty_reason && (
                   <div className="mb-5 p-3 bg-red-500/5 border border-red-500/20 rounded-[12px] text-[11px] font-mono text-red-400">

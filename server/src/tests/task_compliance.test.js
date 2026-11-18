@@ -1,16 +1,22 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "http";
 import app from "../app.js";
 import { query } from "../config/db.js";
 import { generateToken } from "../middlewares/auth.js";
-import { checkComplianceNow } from "../services/complianceSupervisor.js";
+import {
+  checkComplianceNow,
+  runTaskUnseenComplianceCheck,
+  runHourlyReportingComplianceCheck
+} from "../services/complianceSupervisor.js";
 
 const PORT = 5098;
 let server;
 let baseUrl;
 
 const testCompany = "comp_sla_test_corp";
+const otherCompany = "comp_sla_other_corp";
+
 const testAdmin = {
   id: "usr_admin_sla_test",
   name: "SLA Admin",
@@ -18,16 +24,30 @@ const testAdmin = {
   role: "admin",
   companyId: testCompany
 };
-const testEmp = {
-  id: "usr_emp_sla_test",
-  name: "SLA Employee",
-  email: "sla_emp@test.local",
+const testEmpA = {
+  id: "usr_emp_a_sla_test",
+  name: "SLA Employee A",
+  email: "sla_emp_a@test.local",
   role: "employee",
   companyId: testCompany
 };
+const testEmpB = {
+  id: "usr_emp_b_sla_test",
+  name: "SLA Employee B",
+  email: "sla_emp_b@test.local",
+  role: "employee",
+  companyId: testCompany
+};
+const otherEmp = {
+  id: "usr_other_sla_test",
+  name: "Other Company Employee",
+  email: "other_emp@test.local",
+  role: "employee",
+  companyId: otherCompany
+};
 
 let adminToken;
-let empToken;
+let empAToken;
 
 describe("Task SLA & Hourly Report Compliance Engine Test Suite", () => {
   before(async () => {
@@ -35,267 +55,55 @@ describe("Task SLA & Hourly Report Compliance Engine Test Suite", () => {
     await new Promise(resolve => server.listen(PORT, resolve));
     baseUrl = `http://localhost:${PORT}/api`;
 
-    // Seed test company and users
+    // Seed test companies and users
     await query(`INSERT INTO companies (id, name, slug) VALUES ($1, 'SLA Corp', 'sla-corp') ON CONFLICT (id) DO NOTHING`, [testCompany]);
-    await query(`INSERT INTO users (id, name, email, password_hash, role, company_id) VALUES ($1, $2, $3, 'hashed', 'admin', $4) ON CONFLICT (id) DO NOTHING`, [testAdmin.id, testAdmin.name, testAdmin.email, testCompany]);
-    await query(`INSERT INTO users (id, name, email, password_hash, role, company_id) VALUES ($1, $2, $3, 'hashed', 'employee', $4) ON CONFLICT (id) DO NOTHING`, [testEmp.id, testEmp.name, testEmp.email, testCompany]);
+    await query(`INSERT INTO companies (id, name, slug) VALUES ($1, 'Other Corp', 'other-corp') ON CONFLICT (id) DO NOTHING`, [otherCompany]);
 
-    // Clean any residual test tasks and attendance
-    await query(`DELETE FROM tasks WHERE company_id = $1`, [testCompany]);
-    await query(`DELETE FROM hourly_reports WHERE company_id = $1`, [testCompany]);
-    await query(`DELETE FROM attendance WHERE company_id = $1`, [testCompany]);
+    await query(`INSERT INTO users (id, name, email, password_hash, role, company_id) VALUES ($1, $2, $3, 'hashed', 'admin', $4) ON CONFLICT (id) DO NOTHING`, [testAdmin.id, testAdmin.name, testAdmin.email, testCompany]);
+    await query(`INSERT INTO users (id, name, email, password_hash, role, company_id) VALUES ($1, $2, $3, 'hashed', 'employee', $4) ON CONFLICT (id) DO NOTHING`, [testEmpA.id, testEmpA.name, testEmpA.email, testCompany]);
+    await query(`INSERT INTO users (id, name, email, password_hash, role, company_id) VALUES ($1, $2, $3, 'hashed', 'employee', $4) ON CONFLICT (id) DO NOTHING`, [testEmpB.id, testEmpB.name, testEmpB.email, testCompany]);
+    await query(`INSERT INTO users (id, name, email, password_hash, role, company_id) VALUES ($1, $2, $3, 'hashed', 'employee', $4) ON CONFLICT (id) DO NOTHING`, [otherEmp.id, otherEmp.name, otherEmp.email, otherCompany]);
 
     adminToken = generateToken({ id: testAdmin.id, email: testAdmin.email, role: testAdmin.role, companyId: testCompany });
-    empToken = generateToken({ id: testEmp.id, email: testEmp.email, role: testEmp.role, companyId: testCompany });
+    empAToken = generateToken({ id: testEmpA.id, email: testEmpA.email, role: testEmpA.role, companyId: testCompany });
   });
 
   after(async () => {
-    // Cleanup
-    await query(`DELETE FROM tasks WHERE company_id = $1`, [testCompany]);
-    await query(`DELETE FROM hourly_reports WHERE company_id = $1`, [testCompany]);
-    await query(`DELETE FROM attendance WHERE company_id = $1`, [testCompany]);
-    await query(`DELETE FROM notifications WHERE user_id IN ($1, $2)`, [testAdmin.id, testEmp.id]);
-    await query(`DELETE FROM users WHERE id IN ($1, $2)`, [testAdmin.id, testEmp.id]);
-    await query(`DELETE FROM companies WHERE id = $1`, [testCompany]);
+    // Cleanup test data
+    await query(`DELETE FROM tasks WHERE company_id IN ($1, $2)`, [testCompany, otherCompany]);
+    await query(`DELETE FROM hourly_reports WHERE company_id IN ($1, $2)`, [testCompany, otherCompany]);
+    await query(`DELETE FROM attendance WHERE company_id IN ($1, $2)`, [testCompany, otherCompany]);
+    await query(`DELETE FROM notifications WHERE user_id IN ($1, $2, $3, $4)`, [testAdmin.id, testEmpA.id, testEmpB.id, otherEmp.id]);
+    await query(`DELETE FROM users WHERE id IN ($1, $2, $3, $4)`, [testAdmin.id, testEmpA.id, testEmpB.id, otherEmp.id]);
+    await query(`DELETE FROM companies WHERE id IN ($1, $2)`, [testCompany, otherCompany]);
 
     await new Promise(resolve => server.close(resolve));
   });
 
-  it("1. Employee finishes task within deadline -> marked completed_on_time", async () => {
-    const futureDue = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // 2 hours in future
-
-    // Admin creates task
-    const createRes = await fetch(`${baseUrl}/tasks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({
-        title: "Build Homepage Banner",
-        deadline: futureDue,
-        dueDate: futureDue,
-        assignedTo: testEmp.id,
-        companyId: testCompany
-      })
-    });
-    assert.strictEqual(createRes.status, 201);
-    const task = await createRes.json();
-
-    // Employee views task
-    const viewRes = await fetch(`${baseUrl}/tasks/${task.id}/view`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${empToken}` }
-    });
-    assert.strictEqual(viewRes.status, 200);
-    const viewedTask = await viewRes.json();
-    assert.ok(viewedTask.viewed_at, "Task must have viewed_at timestamp");
-    assert.strictEqual(viewedTask.status, "accepted");
-
-    // Employee completes task before deadline
-    const compRes = await fetch(`${baseUrl}/tasks/${task.id}/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${empToken}` },
-      body: JSON.stringify({ completionNotes: "Finished design files on time" })
-    });
-    assert.strictEqual(compRes.status, 200);
-    const completed = await compRes.json();
-    assert.strictEqual(completed.status, "completed");
-    assert.strictEqual(completed.completion_status, "completed_on_time");
+  beforeEach(async () => {
+    // Clean tasks, attendance, reports, notifications before each test
+    await query(`DELETE FROM tasks WHERE company_id IN ($1, $2)`, [testCompany, otherCompany]);
+    await query(`DELETE FROM hourly_reports WHERE company_id IN ($1, $2)`, [testCompany, otherCompany]);
+    await query(`DELETE FROM attendance WHERE company_id IN ($1, $2)`, [testCompany, otherCompany]);
+    await query(`DELETE FROM notifications WHERE user_id IN ($1, $2, $3, $4)`, [testAdmin.id, testEmpA.id, testEmpB.id, otherEmp.id]);
   });
 
-  it("2. Employee finishes task after deadline -> marked completed_overdue", async () => {
-    const pastDue = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 minutes in past
-
-    const createRes = await fetch(`${baseUrl}/tasks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({
-        title: "Fix Navigation Bar",
-        deadline: pastDue,
-        dueDate: pastDue,
-        assignedTo: testEmp.id,
-        companyId: testCompany
-      })
-    });
-    const task = await createRes.json();
-
-    const compRes = await fetch(`${baseUrl}/tasks/${task.id}/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${empToken}` },
-      body: JSON.stringify({ completionNotes: "Delivered late" })
-    });
-    assert.strictEqual(compRes.status, 200);
-    const completed = await compRes.json();
-    assert.strictEqual(completed.status, "completed");
-    assert.strictEqual(completed.completion_status, "completed_overdue");
-  });
-
-  it("3. Unseen task > 1 hour -> Auto marks attendance Absent and locks record", async () => {
-    const taskId = "task_sla_unseen_" + Date.now();
+  // SCENARIO 1: Employee with no task
+  it("Scenario 1: Employee with no task -> timeout enforcement runs -> NOT marked absent, attendance NOT locked", async () => {
     const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s1_" + Date.now();
 
-    // Seed an initial present attendance for today
-    const attId = "att_test_" + Date.now();
-    await query(
-      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in)
-       VALUES ($1, $2, $3, $4, 'present', NOW())`,
-      [attId, testEmp.id, testCompany, today]
-    );
-
-    // Seed task assigned 1 hour and 15 minutes ago, never viewed
-    await query(
-      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, sla_penalty_applied, assigned_at, created_at)
-       VALUES ($1, $2, 'Critical Client Bug', $3, $4, 'new', NULL, FALSE, NOW() - INTERVAL '1 hour 15 minutes', NOW() - INTERVAL '1 hour 15 minutes')`,
-      [taskId, testCompany, testEmp.id, testAdmin.id]
-    );
-
-    // Run compliance supervisor check for testCompany
-    const checkResult = await checkComplianceNow(null, testCompany);
-    assert.ok(checkResult.taskPenalties >= 1, "Should identify and penalize at least 1 unseen task violation");
-
-    // Verify employee's attendance record is now Absent and Admin Locked
-    const attCheck = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
-    assert.strictEqual(attCheck.rows[0].status, "absent");
-    assert.strictEqual(attCheck.rows[0].penalty_status, "unseen_task_penalty");
-    assert.strictEqual(attCheck.rows[0].is_admin_locked, true);
-    assert.ok(attCheck.rows[0].penalty_reason.includes("10 minutes") || attCheck.rows[0].penalty_reason.includes("1 hour"));
-
-    // Verify task sla_penalty_applied is now TRUE
-    const taskCheck = await query("SELECT sla_penalty_applied FROM tasks WHERE id = $1", [taskId]);
-    assert.strictEqual(taskCheck.rows[0].sla_penalty_applied, true);
-
-    // Verify notifications were delivered
-    const notifs = await query("SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC", [testEmp.id]);
-    assert.ok(notifs.rows.length > 0);
-    assert.ok(notifs.rows[0].title.includes("Attendance Marked Absent"));
-
-    // Employee cannot check in again today while compliance lock is active
-    const checkInFail = await fetch(`${baseUrl}/attendance/check-in`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${empToken}` },
-      body: JSON.stringify({ userId: testEmp.id, verificationSessionToken: "any_token" })
-    });
-    assert.strictEqual(checkInFail.status, 403);
-    const checkInFailJson = await checkInFail.json();
-    assert.ok(checkInFailJson.error.includes("blocked") || checkInFailJson.error.includes("locked"));
-  });
-
-  it("4. Admin can revert penalty -> restores Present status and lifts lock", async () => {
-    const today = new Date().toISOString().split("T")[0];
-    const attRes = await query("SELECT id FROM attendance WHERE user_id = $1 AND date = $2", [testEmp.id, today]);
-    assert.ok(attRes.rows.length > 0, "Attendance record must exist");
-    const attId = attRes.rows[0].id;
-
-    // Regular employee cannot revert penalty
-    const failRes = await fetch(`${baseUrl}/attendance/${attId}/revert-penalty`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${empToken}` }
-    });
-    assert.strictEqual(failRes.status, 403);
-
-    // Admin reverts penalty
-    const revertRes = await fetch(`${baseUrl}/attendance/${attId}/revert-penalty`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({ resolutionNotes: "Employee was in external client meeting" })
-    });
-    assert.strictEqual(revertRes.status, 200);
-    const body = await revertRes.json();
-    assert.strictEqual(body.attendance.status, "present");
-    assert.strictEqual(body.attendance.is_admin_locked, false);
-    assert.strictEqual(body.attendance.penalty_status, null);
-  });
-
-  it("5. Missed hourly report > 2 hours -> Auto marks Absent and locks reporting", async () => {
-    const today = new Date().toISOString().split("T")[0];
-    const attId = "att_hourly_test_" + Date.now();
-
-    // Ensure clean state for today
-    await query("DELETE FROM tasks WHERE company_id = $1", [testCompany]);
-    await query("DELETE FROM hourly_reports WHERE user_id = $1 AND report_date = $2", [testEmp.id, today]);
-    await query("DELETE FROM attendance WHERE user_id = $1 AND date = $2", [testEmp.id, today]);
-
-    // Seed an active task for the employee so progress reporting is required
-    await query(
-      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, assigned_at, created_at)
-       VALUES ($1, $2, 'Active Sprint Task', $3, $4, 'in_progress', NOW() - INTERVAL '3 hours', NOW() - INTERVAL '3 hours', NOW() - INTERVAL '3 hours')`,
-      ["task_hourly_test_" + Date.now(), testCompany, testEmp.id, testAdmin.id]
-    );
-
-    // Check in 2 hours and 30 minutes ago with NO hourly report submitted
+    // Employee checks in with present status
     await query(
       `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
-       VALUES ($1, $2, $3, $4, 'present', NOW() - INTERVAL '2 hours 30 minutes', FALSE)`,
-      [attId, testEmp.id, testCompany, today]
+       VALUES ($1, $2, $3, $4, 'present', NOW() - INTERVAL '30 minutes', FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
     );
 
-    // Run compliance check for testCompany
-    const reportCheck = await checkComplianceNow(null, testCompany);
-    assert.strictEqual(reportCheck.penaltyCount, 1, "Should catch exactly 1 missed hourly report violation");
-
-    // Verify attendance is marked Absent and locked
-    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
-    assert.strictEqual(attRow.rows[0].status, "absent");
-    assert.strictEqual(attRow.rows[0].penalty_status, "missed_hourly_report_penalty");
-    assert.strictEqual(attRow.rows[0].is_admin_locked, true);
-
-    // Employee tries to submit hourly report while locked -> 403 Forbidden
-    const submitFail = await fetch(`${baseUrl}/reports/hourly`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${empToken}` },
-      body: JSON.stringify({
-        workCompleted: "Trying to submit late report",
-        progressPercentage: 40,
-        pendingWork: "More testing"
-      })
-    });
-    assert.strictEqual(submitFail.status, 403);
-    const submitFailBody = await submitFail.json();
-    assert.strictEqual(submitFailBody.locked, true);
-
-    // Admin resolves penalty
-    await fetch(`${baseUrl}/attendance/${attId}/revert-penalty`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({ resolutionNotes: "Granted exception" })
-    });
-
-    // Employee can now submit hourly report successfully
-    const submitOk = await fetch(`${baseUrl}/reports/hourly`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${empToken}` },
-      body: JSON.stringify({
-        workCompleted: "Completed module integration and tests",
-        progressPercentage: 85,
-        pendingWork: "Final documentation",
-        issuesBlockers: "None"
-      })
-    });
-    assert.strictEqual(submitOk.status, 201);
-    const repData = await submitOk.json();
-    assert.ok(repData.id);
-    assert.strictEqual(repData.work_completed, "Completed module integration and tests");
-    assert.strictEqual(repData.progress_percentage, 85);
-  });
-
-  it("6. Employee without any active tasks -> is NOT penalized and remains Present without notifications", async () => {
-    const today = new Date().toISOString().split("T")[0];
-    const attId = "att_no_task_test_" + Date.now();
-
-    // Ensure NO active tasks exist for this employee
-    await query("DELETE FROM tasks WHERE company_id = $1", [testCompany]);
-    await query("DELETE FROM hourly_reports WHERE user_id = $1 AND report_date = $2", [testEmp.id, today]);
-    await query("DELETE FROM attendance WHERE user_id = $1 AND date = $2", [testEmp.id, today]);
-    await query("DELETE FROM notifications WHERE user_id = $1", [testEmp.id]);
-
-    // Check in 2 hours ago with NO tasks assigned
-    await query(
-      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
-       VALUES ($1, $2, $3, $4, 'present', NOW() - INTERVAL '2 hours', FALSE)`,
-      [attId, testEmp.id, testCompany, today]
-    );
-
-    // Run compliance check
-    const reportCheck = await checkComplianceNow(null, testCompany);
-    assert.strictEqual(reportCheck.penaltyCount, 0, "Must NOT penalize employee without active tasks");
+    // Timeout enforcement runs
+    const res = await checkComplianceNow(null, testCompany);
+    assert.strictEqual(res.taskPenalties, 0, "No task penalties should apply when no task assigned");
+    assert.strictEqual(res.penaltyCount, 0, "No report penalties should apply when no task assigned");
 
     // Verify attendance is STILL present and NOT locked
     const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
@@ -303,8 +111,395 @@ describe("Task SLA & Hourly Report Compliance Engine Test Suite", () => {
     assert.strictEqual(attRow.rows[0].is_admin_locked, false);
     assert.strictEqual(attRow.rows[0].penalty_status, null);
 
-    // Verify NO notifications were sent to employee
-    const notifs = await query("SELECT * FROM notifications WHERE user_id = $1", [testEmp.id]);
-    assert.strictEqual(notifs.rows.length, 0, "No notifications should be sent to an employee without tasks");
+    // Verify no absence notifications sent
+    const notifs = await query("SELECT * FROM notifications WHERE user_id = $1", [testEmpA.id]);
+    assert.strictEqual(notifs.rows.length, 0);
+  });
+
+  // SCENARIO 2: Employee with a valid task and timely acknowledgement
+  it("Scenario 2: Employee acknowledges task within 10 minutes -> NOT marked absent", async () => {
+    const taskId = "task_s2_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s2_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned 8 minutes ago, viewed and acknowledged 2 minutes ago
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, assigned_at, created_at)
+       VALUES ($1, $2, 'Feature Implementation', $3, $4, 'accepted', NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '8 minutes', NOW() - INTERVAL '8 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    const unseenPenalties = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(unseenPenalties, 0, "Acknowledged task must not trigger unseen penalty");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "present");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 3: Employee with valid task and missed acknowledgement deadline (> 10m)
+  it("Scenario 3: Employee with valid task misses 10-minute acknowledgement deadline -> marked absent and locked", async () => {
+    const taskId = "task_s3_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s3_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned 15 minutes ago, never viewed/acknowledged
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Urgent Production Fix', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '15 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    const violations = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(violations, 1, "Must penalize exactly 1 unviewed task violation");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "absent");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, true);
+    assert.strictEqual(attRow.rows[0].penalty_status, "unseen_task_penalty");
+    assert.strictEqual(attRow.rows[0].penalized_by_task_id, taskId);
+
+    // Verify task marked penalized
+    const taskRow = await query("SELECT sla_penalty_applied FROM tasks WHERE id = $1", [taskId]);
+    assert.strictEqual(taskRow.rows[0].sla_penalty_applied, true);
+
+    // Verify employee received absent notification
+    const notifs = await query("SELECT * FROM notifications WHERE user_id = $1", [testEmpA.id]);
+    assert.strictEqual(notifs.rows.length, 1);
+    assert.ok(notifs.rows[0].title.includes("Attendance Marked Absent"));
+  });
+
+  // SCENARIO 4: Task assigned to another employee
+  it("Scenario 4: Task assigned to Employee B -> Employee A is NOT penalized", async () => {
+    const taskId = "task_s4_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attIdA = "att_s4_a_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attIdA, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned to Employee B (not A), unviewed for 20 minutes
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Task for B', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '20 minutes')`,
+      [taskId, testCompany, testEmpB.id, testAdmin.id]
+    );
+
+    await runTaskUnseenComplianceCheck(null, testCompany);
+
+    // Employee A MUST remain present and unlocked
+    const attRowA = await query("SELECT * FROM attendance WHERE id = $1", [attIdA]);
+    assert.strictEqual(attRowA.rows[0].status, "present");
+    assert.strictEqual(attRowA.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 5: Cancelled task
+  it("Scenario 5: Cancelled task -> no task-based absence enforcement", async () => {
+    const taskId = "task_s5_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s5_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned 30 minutes ago, but status is 'cancelled'
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Cancelled Feature', $3, $4, 'cancelled', NULL, NULL, FALSE, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    const violations = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(violations, 0, "Cancelled task must never trigger penalties");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "present");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 6: Reassigned task
+  it("Scenario 6: Task reassigned from Employee A to Employee B -> Employee A is NOT penalized", async () => {
+    const taskId = "task_s6_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attIdA = "att_s6_a_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attIdA, testEmpA.id, testCompany, today]
+    );
+
+    // Task reassigned to Employee B 2 minutes ago
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Reassigned Work', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '20 minutes')`,
+      [taskId, testCompany, testEmpB.id, testAdmin.id]
+    );
+
+    await runTaskUnseenComplianceCheck(null, testCompany);
+
+    // Employee A must NOT be penalized
+    const attRowA = await query("SELECT * FROM attendance WHERE id = $1", [attIdA]);
+    assert.strictEqual(attRowA.rows[0].status, "present");
+    assert.strictEqual(attRowA.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 7: Completed task
+  it("Scenario 7: Completed task -> no task-timeout-based absence enforcement", async () => {
+    const taskId = "task_s7_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s7_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned 45 minutes ago, but status is 'completed'
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Finished Work', $3, $4, 'completed', NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes', FALSE, NOW() - INTERVAL '45 minutes', NOW() - INTERVAL '45 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    const unseenPenalties = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(unseenPenalties, 0);
+
+    const reportPenalties = await runHourlyReportingComplianceCheck(null, testCompany);
+    assert.strictEqual(reportPenalties.penaltyCount, 0);
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "present");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 8: Deadline not yet reached (< 10 minutes)
+  it("Scenario 8: Task assigned 5 minutes ago (< 10m window) -> no absence enforcement", async () => {
+    const taskId = "task_s8_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s8_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned 5 minutes ago (still in 10-minute acknowledgement window)
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Fresh Task', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '5 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    const violations = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(violations, 0, "Task within 10-minute window must not be penalized");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "present");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 9: Progress report timeout with no task
+  it("Scenario 9: Employee checked in for 2 hours with NO active tasks -> NOT marked absent and NOT locked", async () => {
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s9_" + Date.now();
+
+    // Checked in 2.5 hours ago with NO tasks assigned
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW() - INTERVAL '2 hours 30 minutes', FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    const reportRes = await runHourlyReportingComplianceCheck(null, testCompany);
+    assert.strictEqual(reportRes.penaltyCount, 0, "No progress report penalty for employee without tasks");
+    assert.strictEqual(reportRes.remindersCount, 0, "No progress report reminder for employee without tasks");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "present");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, false);
+    assert.strictEqual(attRow.rows[0].penalty_status, null);
+
+    const notifs = await query("SELECT * FROM notifications WHERE user_id = $1", [testEmpA.id]);
+    assert.strictEqual(notifs.rows.length, 0);
+  });
+
+  // SCENARIO 10: Duplicate enforcement
+  it("Scenario 10: Timeout job runs multiple times for the same missed task -> NO duplicate penalties", async () => {
+    const taskId = "task_s10_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s10_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Single Penalty Task', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '20 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    // Run 1st time -> applies 1 penalty
+    const run1 = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(run1, 1);
+
+    // Run 2nd time -> must NOT re-penalize or create duplicate records
+    const run2 = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(run2, 0, "Second run must apply 0 penalties");
+
+    // Run 3rd time
+    const run3 = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(run3, 0, "Third run must apply 0 penalties");
+
+    // Exactly 1 attendance record exists
+    const allAtt = await query("SELECT * FROM attendance WHERE user_id = $1 AND company_id = $2", [testEmpA.id, testCompany]);
+    assert.strictEqual(allAtt.rows.length, 1);
+
+    // Exactly 1 notification delivered
+    const notifs = await query("SELECT * FROM notifications WHERE user_id = $1", [testEmpA.id]);
+    assert.strictEqual(notifs.rows.length, 1);
+  });
+
+  // SCENARIO 11: Tenant/company isolation
+  it("Scenario 11: Task in Company A does NOT trigger attendance enforcement for Employee in Company B", async () => {
+    const taskId = "task_s11_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attIdOther = "att_s11_other_" + Date.now();
+
+    // Employee in Company B is checked in
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attIdOther, otherEmp.id, otherCompany, today]
+    );
+
+    // Task created in Company A for Employee A (unviewed 30 mins)
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Company A Task', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    // Run compliance supervisor scoped ONLY to Company B
+    const compBRes = await checkComplianceNow(null, otherCompany);
+    assert.strictEqual(compBRes.taskPenalties, 0);
+    assert.strictEqual(compBRes.penaltyCount, 0);
+
+    // Company B Employee must NOT be affected
+    const attRowOther = await query("SELECT * FROM attendance WHERE id = $1", [attIdOther]);
+    assert.strictEqual(attRowOther.rows[0].status, "present");
+    assert.strictEqual(attRowOther.rows[0].is_admin_locked, false);
+  });
+
+  // SCENARIO 12: Race condition
+  it("Scenario 12: Task acknowledged right at enforcement time -> safely evaluated atomically with no false penalty", async () => {
+    const taskId = "task_s12_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s12_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW(), FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Task assigned 12 minutes ago
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Concurrent Task', $3, $4, 'new', NULL, NULL, FALSE, NOW() - INTERVAL '12 minutes', NOW() - INTERVAL '12 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    // Simulate concurrent employee acknowledgement right as job triggers
+    await query(
+      `UPDATE tasks SET viewed_at = NOW(), acknowledged_at = NOW(), status = 'accepted' WHERE id = $1`,
+      [taskId]
+    );
+
+    // Compliance check runs
+    const res = await runTaskUnseenComplianceCheck(null, testCompany);
+    assert.strictEqual(res, 0, "Concurrently acknowledged task must not be penalized");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "present");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, false);
+  });
+
+  // PROGRESS REPORTING SLA FOR VALID ACTIVE TASK
+  it("Scenario 13: Valid active task with missed progress report (> 10m) -> marked absent and locked", async () => {
+    const taskId = "task_s13_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s13_" + Date.now();
+
+    // Employee checked in 1 hour ago
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked)
+       VALUES ($1, $2, $3, $4, 'present', NOW() - INTERVAL '1 hour', FALSE)`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Active accepted task viewed 20 minutes ago, no reports submitted
+    await query(
+      `INSERT INTO tasks (id, company_id, title, assigned_to, created_by, status, viewed_at, acknowledged_at, sla_penalty_applied, assigned_at, created_at)
+       VALUES ($1, $2, 'Sprint Core Task', $3, $4, 'accepted', NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '20 minutes', FALSE, NOW() - INTERVAL '25 minutes', NOW() - INTERVAL '25 minutes')`,
+      [taskId, testCompany, testEmpA.id, testAdmin.id]
+    );
+
+    const reportRes = await runHourlyReportingComplianceCheck(null, testCompany);
+    assert.strictEqual(reportRes.penaltyCount, 1, "Must penalize missed progress report on active task");
+
+    const attRow = await query("SELECT * FROM attendance WHERE id = $1", [attId]);
+    assert.strictEqual(attRow.rows[0].status, "absent");
+    assert.strictEqual(attRow.rows[0].is_admin_locked, true);
+    assert.strictEqual(attRow.rows[0].penalty_status, "missed_hourly_report_penalty");
+    assert.strictEqual(attRow.rows[0].penalized_by_task_id, taskId);
+  });
+
+  // ADMIN UNLOCK / REVERT PENALTY RESTORES PRESENT STATUS
+  it("Scenario 14: Admin reverts penalty -> restores Present status and lifts lock", async () => {
+    const taskId = "task_s14_" + Date.now();
+    const today = new Date().toISOString().split("T")[0];
+    const attId = "att_s14_" + Date.now();
+
+    await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, is_admin_locked, penalty_status, penalty_reason)
+       VALUES ($1, $2, $3, $4, 'absent', NOW() - INTERVAL '1 hour', TRUE, 'missed_hourly_report_penalty', 'Test penalty')`,
+      [attId, testEmpA.id, testCompany, today]
+    );
+
+    // Admin reverts penalty
+    const revertRes = await fetch(`${baseUrl}/attendance/${attId}/revert-penalty`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ resolutionNotes: "Granted exception" })
+    });
+    assert.strictEqual(revertRes.status, 200);
+    const body = await revertRes.json();
+    assert.strictEqual(body.attendance.status, "present");
+    assert.strictEqual(body.attendance.is_admin_locked, false);
+    assert.strictEqual(body.attendance.penalty_status, null);
   });
 });

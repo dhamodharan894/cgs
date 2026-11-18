@@ -1051,7 +1051,7 @@ export default function TaskManagement() {
               </div>
               <h3 className="text-lg font-bold text-text-main">No Tasks Assigned</h3>
               <p className="text-xs text-text-sec max-w-sm mt-2">
-                You have no active tasks assigned right now. When an administrator assigns a task, it will appear here immediately with a 1-hour view acknowledgement requirement.
+                No active task assigned. Attendance is not affected by task acknowledgement requirements.
               </p>
             </div>
           ) : (
@@ -1067,7 +1067,7 @@ export default function TaskManagement() {
 
                 {tasks.filter(t => !t.completed).length === 0 ? (
                   <div className="p-8 border border-dashed border-border-card rounded-[18px] text-center text-text-mut text-xs">
-                    No active tasks currently pending.
+                    No active tasks currently pending. Attendance is not affected by task acknowledgement requirements.
                   </div>
                 ) : (
                   tasks.filter(t => !t.completed).map((task) => {

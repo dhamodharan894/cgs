@@ -719,7 +719,13 @@ export const submitHourlyReport = async (req, res) => {
           [companyId]
         );
         const employeeName = req.user?.name || "Employee";
-        const targetTitle = taskTitle || "Task";
+        let targetTitle = "General Update";
+        if (taskId) {
+          const tRes = await query("SELECT title FROM tasks WHERE id = $1", [taskId]);
+          if (tRes.rows.length > 0 && tRes.rows[0].title) {
+            targetTitle = tRes.rows[0].title;
+          }
+        }
         for (const admin of adminsRes.rows) {
           if (admin.id === userId) continue;
           await sendNotificationOnce({

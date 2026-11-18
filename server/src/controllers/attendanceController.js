@@ -1573,7 +1573,35 @@ export const checkIn = async (req, res) => {
     const now = new Date().toISOString();
     const { location, workMode = "office", verificationSessionToken } = req.body;
     const recordId = `${userId}_${today}`;
-    // Compliance lock check removed per user request - employees are not blocked from check-in
+
+    // Enforce compliance lock: Employee cannot check in again today once marked absent/locked by compliance
+    const lockCheck = await query(
+      `SELECT id, status, is_admin_locked, penalty_status, penalty_reason
+       FROM attendance
+       WHERE (id = $1 OR (user_id = $2 AND (date = $3 OR date = CURRENT_DATE)))
+         AND (is_admin_locked IS TRUE OR penalty_status IS NOT NULL OR status = 'absent')
+       ORDER BY created_at DESC LIMIT 1`,
+      [recordId, userId, today]
+    );
+
+    if (lockCheck.rows.length > 0) {
+      const lockedRow = lockCheck.rows[0];
+      if (lockedRow.is_admin_locked || lockedRow.penalty_status || lockedRow.status === "absent") {
+        auditService.logAudit({
+          userId,
+          action: "ATTENDANCE_CHECKIN_BLOCKED_COMPLIANCE_LOCK",
+          resourceType: "attendance",
+          resourceId: lockedRow.id,
+          details: { reason: "Locked out due to compliance penalty; requires Admin resolution", penaltyReason: lockedRow.penalty_reason },
+          req
+        });
+        return res.status(403).json({
+          error: "Check-in blocked: Your attendance for today is marked Absent and locked due to compliance penalty. You cannot check in again today unless unlocked by an Administrator.",
+          locked: true,
+          penaltyReason: lockedRow.penalty_reason || "Task was not viewed within 10 minutes."
+        });
+      }
+    }
 
     if (!verificationSessionToken) {
       return res.status(400).json({
