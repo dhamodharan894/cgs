@@ -279,10 +279,6 @@ export default function TaskManagement() {
     if (isCompleted || task.status === "cancelled" || task.status === "suspended") {
       return null;
     }
-    const dl = task.deadline || task.metadata?.deadlineTimestamp || task.due_date || task.dueDate;
-    if (dl && new Date(dl).getTime() < now) {
-      return null;
-    }
     const todayStr = new Date().toISOString().split("T")[0];
     const sessionKey = `hourly_cycle_${task.id}_${todayStr}`;
     let baseTime = null;
@@ -341,7 +337,7 @@ export default function TaskManagement() {
 
     if (diff <= 0) {
       const overdueMins = Math.floor(Math.abs(diff) / 60000);
-      if (overdueMins >= 5) {
+      if (isRecordLocked) {
         return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
       }
       return { isOverdue: true, isLocked: false, text: `Report overdue by ${overdueMins}m` };
@@ -492,9 +488,8 @@ export default function TaskManagement() {
 
     const targetTask = tasks.find(t => t.id === targetTaskId);
     if (targetTask && !isAdmin) {
-      const effDl = getEffectiveDeadline(targetTask);
-      if (effDl && new Date(effDl).getTime() < Date.now()) {
-        return showToast("Task deadline has finished. Progress reporting is locked for this task.", "warning");
+      if (targetTask.slaPenaltyApplied || targetTask.sla_penalty_applied) {
+        return showToast("Reporting is locked because attendance was marked Absent due to missing reports (> 10m). Please contact Admin to unlock.", "warning");
       }
     }
 
@@ -623,9 +618,8 @@ export default function TaskManagement() {
   const handleMarkComplete = async (task, isComplete) => {
     try {
       if (!isAdmin) {
-        const effDl = getEffectiveDeadline(task);
-        if (effDl && new Date(effDl).getTime() < Date.now()) {
-          showToast("Task deadline has finished. Functionality is locked for this task.", "warning");
+        if (task.slaPenaltyApplied || task.sla_penalty_applied) {
+          showToast("Task actions are locked because attendance was marked Absent. Please contact your Admin.", "warning");
           return;
         }
       }
@@ -686,17 +680,13 @@ export default function TaskManagement() {
                   showToast("Reporting is locked: all active tasks have missed reports (> 10m). Please contact Admin to unlock.", "warning");
                   return;
                 }
-                const availableTasks = unpenalizedTasks.filter(t => {
-                  const dl = getEffectiveDeadline(t);
-                  return !(dl && new Date(dl).getTime() < Date.now());
-                });
-                if (availableTasks.length === 0) {
-                  showToast("Task deadline has finished. Functionality is locked because no active tasks are within deadline.", "warning");
+                const active = unpenalizedTasks[0];
+                if (!active) {
+                  showToast("No active tasks available to report on.", "info");
                   return;
                 }
-                const active = availableTasks[0];
-                setSelectedTask(active || null);
-                setReportTaskId(active ? active.id : "");
+                setSelectedTask(active);
+                setReportTaskId(active.id);
                 setShowHourlyReportModal(true);
               }}
               className="flex items-center gap-2 bg-brand-primary text-white hover:bg-brand-primary/90 px-4 py-2.5 rounded-[12px] font-bold text-xs shadow-sm transition-all cursor-pointer"
@@ -1080,22 +1070,20 @@ export default function TaskManagement() {
                       task.sla_penalty_applied ||
                       (nextReport && nextReport.isLocked)
                     );
-                    const isDeadlineFinished = Boolean(
-                      !isAdmin && (
-                        (countdown && countdown.isOverdue) ||
-                        (effectiveDeadline && new Date(effectiveDeadline).getTime() < now)
-                      )
+                    const isOverdue = Boolean(
+                      (countdown && countdown.isOverdue) ||
+                      (effectiveDeadline && new Date(effectiveDeadline).getTime() < now)
                     );
-                    const isTaskBlocked = Boolean(!isAdmin && (isDeadlineFinished || isPenalized));
+                    const isTaskBlocked = Boolean(!isAdmin && isPenalized);
 
                     return (
                       <div
                         key={task.id}
                         className={`bg-bg-card border rounded-[20px] p-5 shadow-sm transition-all relative overflow-hidden text-left ${
-                          isDeadlineFinished
-                            ? "border-amber-500/50 bg-amber-500/[0.03]"
-                            : isPenalized 
-                              ? "border-red-500/40 bg-red-500/[0.02]" 
+                          isPenalized 
+                            ? "border-red-500/40 bg-red-500/[0.02]" 
+                            : isOverdue
+                              ? "border-amber-500/50 bg-amber-500/[0.03]"
                               : isNew 
                                 ? "border-brand-primary/50 shadow-brand-primary/5" 
                                 : "border-border-card hover:border-brand-primary/30"
@@ -1103,9 +1091,7 @@ export default function TaskManagement() {
                       >
                         {/* Status bar */}
                         <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${
-                          isDeadlineFinished
-                            ? "bg-amber-500"
-                            : isPenalized ? "bg-red-500" : isNew ? "bg-brand-primary animate-pulse" : "bg-blue-500"
+                          isPenalized ? "bg-red-500" : isOverdue ? "bg-amber-500" : isNew ? "bg-brand-primary animate-pulse" : "bg-blue-500"
                         }`}></div>
 
                         <div className="flex justify-between items-start mb-2">
@@ -1123,10 +1109,10 @@ export default function TaskManagement() {
                                   Attendance Penalized (Absent)
                                 </span>
                               )}
-                              {isDeadlineFinished && (
+                              {!isPenalized && isOverdue && (
                                 <span className="bg-amber-500/20 text-amber-400 border border-amber-500/30 text-[10px] font-black uppercase px-2 py-0.5 rounded-full flex items-center gap-1">
-                                  <Lock size={10} />
-                                  Deadline Expired (Locked)
+                                  <Clock size={10} />
+                                  Overdue
                                 </span>
                               )}
                             </div>
@@ -1138,10 +1124,6 @@ export default function TaskManagement() {
                           {/* Complete action */}
                           <button
                             onClick={() => {
-                              if (isDeadlineFinished) {
-                                showToast("Task deadline has finished. Functionality is locked for this task.", "warning");
-                                return;
-                              }
                               if (isPenalized) {
                                 showToast("Task actions are locked because attendance was marked Absent. Please contact your Admin.", "warning");
                                 return;
@@ -1154,9 +1136,9 @@ export default function TaskManagement() {
                                 ? "border-red-500/40 text-red-400/70 bg-red-500/10 cursor-not-allowed opacity-60"
                                 : "border-border-card text-transparent hover:border-emerald-500 hover:text-emerald-500 hover:bg-emerald-500/10 transition-all cursor-pointer"
                             }`}
-                            title={isDeadlineFinished ? "Task deadline has finished. Completion is locked." : "Mark as completed (triggers SLA evaluation)"}
+                            title={isPenalized ? "Task actions locked: attendance marked Absent." : "Mark as completed (triggers SLA evaluation)"}
                           >
-                            {isDeadlineFinished ? <Lock size={14} /> : <CheckCircle size={16} />}
+                            {isPenalized ? <Lock size={14} /> : <CheckCircle size={16} />}
                           </button>
                         </div>
 
@@ -1188,16 +1170,12 @@ export default function TaskManagement() {
 
                           <div>
                             <span className="text-[10px] font-bold text-text-mut uppercase block">Hourly Report</span>
-                            {isDeadlineFinished ? (
-                              <span className="text-xs font-bold text-amber-500 flex items-center gap-1 mt-0.5">
-                                <Lock size={11} /> Locked (Deadline passed)
-                              </span>
-                            ) : isPenalized ? (
+                            {isPenalized ? (
                               <span className="text-xs font-bold text-red-500 flex items-center gap-1 mt-0.5">
                                 <Lock size={11} /> Locked (Absent Penalty)
                               </span>
                             ) : nextReport ? (
-                              <span className={`text-xs font-bold block ${nextReport.isOverdue ? "text-red-500 font-extrabold" : "text-blue-500"}`}>
+                              <span className={`text-xs font-bold block ${nextReport.isOverdue ? "text-amber-500 font-extrabold" : "text-blue-500"}`}>
                                 {nextReport.text}
                               </span>
                             ) : (
@@ -1207,10 +1185,10 @@ export default function TaskManagement() {
                         </div>
 
                         {/* Overdue deadline warning alert */}
-                        {isDeadlineFinished && (
+                        {isOverdue && !isPenalized && (
                           <div className="mb-3 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-[12px] flex items-center gap-2 text-[11px] text-amber-500 font-semibold">
-                            <Lock size={14} className="flex-shrink-0" />
-                            <span>Task deadline has expired. All employee modifications are locked. Contact your administrator if an extension is required.</span>
+                            <Clock size={14} className="flex-shrink-0" />
+                            <span>Task deadline has passed. Please complete this task or submit your progress update as soon as possible.</span>
                           </div>
                         )}
 
@@ -1226,10 +1204,6 @@ export default function TaskManagement() {
                         <div className="flex items-center justify-between gap-3 pt-2 border-t border-border-card/60">
                           <button
                             onClick={() => {
-                              if (isDeadlineFinished) {
-                                showToast("Task deadline has finished. Progress reporting is locked.", "warning");
-                                return;
-                              }
                               if (isPenalized) {
                                 showToast("Reporting is locked because attendance was marked Absent due to missing reports (> 10m). Please contact Admin to unlock.", "warning");
                                 return;
@@ -1240,16 +1214,14 @@ export default function TaskManagement() {
                             }}
                             disabled={isTaskBlocked}
                             className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-[10px] text-xs font-bold transition-all ${
-                              isDeadlineFinished
-                                ? "bg-amber-500/10 text-amber-400/70 border border-amber-500/20 cursor-not-allowed opacity-60"
-                                : isPenalized
-                                  ? "bg-red-500/10 text-red-400/70 border border-red-500/20 cursor-not-allowed opacity-60"
-                                  : "bg-brand-primary/10 text-brand-primary hover:bg-brand-primary hover:text-white rounded-[10px] text-xs font-bold transition-all cursor-pointer"
+                              isPenalized
+                                ? "bg-red-500/10 text-red-400/70 border border-red-500/20 cursor-not-allowed opacity-60"
+                                : "bg-brand-primary/10 text-brand-primary hover:bg-brand-primary hover:text-white rounded-[10px] text-xs font-bold transition-all cursor-pointer"
                             }`}
-                            title={isDeadlineFinished ? "Task deadline has finished. Reporting is locked." : isPenalized ? "Reporting locked: attendance marked Absent." : "Submit Hourly Report"}
+                            title={isPenalized ? "Reporting locked: attendance marked Absent." : "Submit Hourly Report"}
                           >
-                            {isDeadlineFinished ? <Lock size={13} /> : isPenalized ? <Lock size={13} /> : <Send size={13} />}
-                            {isDeadlineFinished ? "Deadline Expired (Locked)" : isPenalized ? "Reporting Locked (Absent)" : "Submit Hourly Report"}
+                            {isPenalized ? <Lock size={13} /> : <Send size={13} />}
+                            {isPenalized ? "Reporting Locked (Absent)" : "Submit Hourly Report"}
                           </button>
 
                           <button
@@ -1688,10 +1660,10 @@ export default function TaskManagement() {
                   <option value="">Select an assigned task...</option>
                   {tasks.filter(t => !t.completed).map(t => {
                     const effDl = getEffectiveDeadline(t);
-                    const isExpired = Boolean(!isAdmin && effDl && new Date(effDl).getTime() < Date.now());
+                    const isOverdue = Boolean(effDl && new Date(effDl).getTime() < Date.now());
                     return (
-                      <option key={t.id} value={t.id} disabled={isExpired}>
-                        {t.title} {t.project ? `(${t.project})` : ""} {isExpired ? " [Deadline Finished - Locked]" : ""}
+                      <option key={t.id} value={t.id}>
+                        {t.title} {t.project ? `(${t.project})` : ""} {isOverdue ? " (Overdue)" : ""}
                       </option>
                     );
                   })}

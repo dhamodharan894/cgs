@@ -27,12 +27,87 @@ export const getUsers = async (req, res) => {
 
     sql += " ORDER BY name ASC";
     const result = await query(sql, params);
+
+    // Fetch authoritative tasks from tasks table for all users
+    let taskSql = `
+      SELECT t.id, t.title, t.description, t.status, t.project_id, t.assigned_to,
+             t.created_at, t.assigned_at, t.created_by, t.deadline, t.due_date,
+             t.duration_minutes, t.priority, t.completion_status,
+             p.name as project_name
+      FROM tasks t
+      LEFT JOIN projects p ON (p.id = t.project_id OR p.name = t.project_id)
+      WHERE t.assigned_to IS NOT NULL
+    `;
+    const taskParams = [];
+    if (targetCompanyId) {
+      taskParams.push(targetCompanyId);
+      taskSql += ` AND (t.company_id = $${taskParams.length} OR t.company_id IS NULL)`;
+    }
+    taskSql += ` ORDER BY COALESCE(t.assigned_at, t.created_at) DESC`;
+
+    const tasksRes = await query(taskSql, taskParams).catch(() => ({ rows: [] }));
+    const tasksByUser = new Map();
+    for (const t of tasksRes.rows) {
+      const uId = String(t.assigned_to);
+      if (!tasksByUser.has(uId)) {
+        tasksByUser.set(uId, []);
+      }
+      tasksByUser.get(uId).push(t);
+    }
     
     // Map response so frontend expecting camelCase (uid, companyId, etc.) gets full compatibility
     const users = result.rows.map(row => {
       const { metadata = {}, ...rest } = row;
       const meta = metadata && typeof metadata === "object" ? metadata : {};
       const empId = row.employee_id || meta.employeeId || meta.employee_id || "";
+
+      // Build unified up-to-date task list from DB tasks + metadata tasks
+      const dbUserTasks = tasksByUser.get(String(row.id)) || [];
+      const tasksList = [];
+      const seenIds = new Set();
+
+      // First include all tasks from tasks table (the authoritative source)
+      for (const dbt of dbUserTasks) {
+        const tid = String(dbt.id);
+        seenIds.add(tid);
+        const isCompleted = dbt.status === "completed" || dbt.status === "Completed" ||
+          dbt.completion_status === "completed_on_time" || dbt.completion_status === "completed_overdue";
+        tasksList.push({
+          id: tid,
+          title: dbt.title || "Untitled Task",
+          description: dbt.description || "",
+          project: dbt.project_name || dbt.project_id || "",
+          projectId: dbt.project_id || "",
+          status: dbt.status || (isCompleted ? "completed" : "pending"),
+          completed: isCompleted,
+          completionStatus: dbt.completion_status || (isCompleted ? "completed_on_time" : null),
+          deadline: dbt.deadline || dbt.due_date || null,
+          dueDate: dbt.due_date || dbt.deadline || null,
+          duration: dbt.duration_minutes ? Math.round(dbt.duration_minutes / 60) : 1,
+          durationMinutes: dbt.duration_minutes || 60,
+          assignedAt: dbt.assigned_at || dbt.created_at,
+          assignedBy: dbt.created_by
+        });
+      }
+
+      // Merge any metadata tasks that might not be in tasks table yet (e.g. legacy/offline)
+      if (Array.isArray(meta.tasks)) {
+        for (const mt of meta.tasks) {
+          const tid = String(mt.id);
+          if (!seenIds.has(tid)) {
+            seenIds.add(tid);
+            const isCompleted = mt.completed === true || mt.completed === "true" ||
+              mt.status === "completed" || mt.status === "Completed";
+            tasksList.push({
+              ...mt,
+              id: tid,
+              completed: isCompleted,
+              status: mt.status || (isCompleted ? "completed" : "pending")
+            });
+          }
+        }
+      }
+
       return {
         ...rest,
         ...meta,
@@ -49,7 +124,7 @@ export const getUsers = async (req, res) => {
         casualLeaves: Number(row.paid_leave_quota || 6),
         isProjectManager: row.is_project_manager,
         projects: Array.isArray(row.projects) ? row.projects : (meta.projects || []),
-        tasks: Array.isArray(meta.tasks) ? meta.tasks : [],
+        tasks: tasksList,
         grossSalary: Number(row.gross_salary || 0),
         paidDays: Number(row.paid_days || 0)
       };
@@ -91,29 +166,45 @@ export const getUserById = async (req, res) => {
 
     // Fetch tasks from tasks table assigned to this user
     const dbTasks = await query(
-      "SELECT id, title, description, status, project_id, created_at, created_by FROM tasks WHERE assigned_to = $1",
+      `SELECT t.id, t.title, t.description, t.status, t.project_id, t.created_at, t.assigned_at,
+              t.created_by, t.deadline, t.due_date, t.duration_minutes, t.priority, t.completion_status,
+              p.name as project_name
+       FROM tasks t
+       LEFT JOIN projects p ON (p.id = t.project_id OR p.name = t.project_id)
+       WHERE t.assigned_to = $1`,
       [id]
     ).catch(() => ({ rows: [] }));
 
     for (const dbt of dbTasks.rows) {
       const tid = String(dbt.id);
+      const isCompleted = dbt.status === "completed" || dbt.status === "Completed" ||
+        dbt.completion_status === "completed_on_time" || dbt.completion_status === "completed_overdue";
       if (!taskIds.has(tid)) {
         tasksList.push({
           id: tid,
           title: dbt.title,
           description: dbt.description || "",
-          project: dbt.project_id || "",
-          completed: dbt.status === "completed" || dbt.status === "Completed",
-          status: dbt.status || "pending",
-          assignedAt: dbt.created_at,
+          project: dbt.project_name || dbt.project_id || "",
+          projectId: dbt.project_id || "",
+          completed: isCompleted,
+          status: dbt.status || (isCompleted ? "completed" : "pending"),
+          completionStatus: dbt.completion_status || (isCompleted ? "completed_on_time" : null),
+          deadline: dbt.deadline || dbt.due_date || null,
+          dueDate: dbt.due_date || dbt.deadline || null,
+          duration: dbt.duration_minutes ? Math.round(dbt.duration_minutes / 60) : 1,
+          durationMinutes: dbt.duration_minutes || 60,
+          assignedAt: dbt.assigned_at || dbt.created_at,
           assignedBy: dbt.created_by
         });
         taskIds.add(tid);
       } else {
         const existing = tasksList.find(t => String(t.id) === tid);
-        if (existing && dbt.status) {
-          if (dbt.status === "completed" || dbt.status === "Completed") existing.completed = true;
-          else if (dbt.status === "pending") existing.completed = false;
+        if (existing) {
+          existing.status = dbt.status || existing.status;
+          existing.completed = isCompleted;
+          if (dbt.title) existing.title = dbt.title;
+          if (dbt.project_name || dbt.project_id) existing.project = dbt.project_name || dbt.project_id;
+          if (dbt.deadline) existing.deadline = dbt.deadline;
         }
       }
     }

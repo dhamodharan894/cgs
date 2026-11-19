@@ -72,18 +72,18 @@ export const getProjects = async (req, res) => {
              ) as team_members,
              (
                SELECT count(*) FROM (
-                 SELECT t.id FROM tasks t WHERE t.project_id = p.id
-                 UNION ALL
+                 SELECT t.id FROM tasks t WHERE (t.project_id = p.id OR t.project_id = p.name)
+                 UNION
                  SELECT elem->>'id' FROM users u_t, jsonb_array_elements(COALESCE(u_t.metadata->'tasks', '[]'::jsonb)) elem
                  WHERE u_t.company_id = p.company_id AND elem->>'project' = p.name
                ) sub_tasks
              ) as task_count,
              (
                SELECT count(*) FROM (
-                 SELECT t.id FROM tasks t WHERE t.project_id = p.id AND (t.status = 'completed' OR t.status = 'Completed')
-                 UNION ALL
+                 SELECT t.id FROM tasks t WHERE (t.project_id = p.id OR t.project_id = p.name) AND (t.status = 'completed' OR t.status = 'Completed' OR t.completion_status = 'completed_on_time' OR t.completion_status = 'completed_overdue')
+                 UNION
                  SELECT elem->>'id' FROM users u_t, jsonb_array_elements(COALESCE(u_t.metadata->'tasks', '[]'::jsonb)) elem
-                 WHERE u_t.company_id = p.company_id AND elem->>'project' = p.name AND (elem->>'completed')::boolean = true
+                 WHERE u_t.company_id = p.company_id AND elem->>'project' = p.name AND ((elem->>'completed')::boolean = true OR elem->>'status' = 'completed' OR elem->>'status' = 'Completed')
                ) sub_tasks_comp
              ) as completed_task_count
       FROM projects p
@@ -253,18 +253,18 @@ export const updateProject = async (req, res) => {
               ) as team_members,
               (
                 SELECT count(*) FROM (
-                  SELECT t.id FROM tasks t WHERE t.project_id = p.id
-                  UNION ALL
+                  SELECT t.id FROM tasks t WHERE (t.project_id = p.id OR t.project_id = p.name)
+                  UNION
                   SELECT elem->>'id' FROM users u_t, jsonb_array_elements(COALESCE(u_t.metadata->'tasks', '[]'::jsonb)) elem
                   WHERE u_t.company_id = p.company_id AND elem->>'project' = p.name
                 ) sub_tasks
               ) as task_count,
               (
                 SELECT count(*) FROM (
-                  SELECT t.id FROM tasks t WHERE t.project_id = p.id AND (t.status = 'completed' OR t.status = 'Completed')
-                  UNION ALL
+                  SELECT t.id FROM tasks t WHERE (t.project_id = p.id OR t.project_id = p.name) AND (t.status = 'completed' OR t.status = 'Completed' OR t.completion_status = 'completed_on_time' OR t.completion_status = 'completed_overdue')
+                  UNION
                   SELECT elem->>'id' FROM users u_t, jsonb_array_elements(COALESCE(u_t.metadata->'tasks', '[]'::jsonb)) elem
-                  WHERE u_t.company_id = p.company_id AND elem->>'project' = p.name AND (elem->>'completed')::boolean = true
+                  WHERE u_t.company_id = p.company_id AND elem->>'project' = p.name AND ((elem->>'completed')::boolean = true OR elem->>'status' = 'completed' OR elem->>'status' = 'Completed')
                 ) sub_tasks_comp
               ) as completed_task_count
        FROM projects p

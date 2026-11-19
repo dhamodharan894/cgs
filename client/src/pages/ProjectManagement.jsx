@@ -1361,6 +1361,7 @@ export default function ProjectManagement() {
 
     try {
       await updateUserTasks(taskTargetUser.uid, currentTasks);
+      setTaskTargetUser(prev => prev ? { ...prev, tasks: currentTasks } : null);
       
       if (editingTaskIndex === null) {
         await createNotification(
@@ -2051,7 +2052,15 @@ export default function ProjectManagement() {
                     t.completed === true || 
                     t.completed === "true" || 
                     t.isCompleted === true || 
-                    (typeof t.status === "string" && t.status.toLowerCase() === "completed")
+                    (typeof t.status === "string" && (
+                      t.status.toLowerCase() === "completed" ||
+                      t.status.toLowerCase() === "completed_overdue" ||
+                      t.status.toLowerCase() === "completed_on_time"
+                    )) ||
+                    (typeof t.completionStatus === "string" && (
+                      t.completionStatus.toLowerCase() === "completed_on_time" ||
+                      t.completionStatus.toLowerCase() === "completed_overdue"
+                    ))
                   )).length;
                   const progress = tasks.length > 0 ? Math.min(100, Math.round((completedCount / tasks.length) * 100)) : 0;
 
@@ -2785,18 +2794,29 @@ export default function ProjectManagement() {
                   </p>
                 ) : (
                   <div className="space-y-2">
-                    {taskTargetUser.tasks.map((task, idx) => (
-                      <div key={task.id || idx} className={`p-3 rounded-[12px] border ${task.completed ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-bg-card border-border-card'} flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all hover:shadow-sm`}>
+                    {taskTargetUser.tasks.map((task, idx) => {
+                      const isTaskCompleted = Boolean(
+                        task.completed === true || 
+                        task.completed === "true" || 
+                        task.isCompleted === true || 
+                        (typeof task.status === "string" && (
+                          task.status.toLowerCase() === "completed" ||
+                          task.status.toLowerCase() === "completed_overdue" ||
+                          task.status.toLowerCase() === "completed_on_time"
+                        ))
+                      );
+                      return (
+                      <div key={task.id || idx} className={`p-3 rounded-[12px] border ${isTaskCompleted ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-bg-card border-border-card'} flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all hover:shadow-sm`}>
                         <div className="flex items-start gap-3">
                           <div className="mt-0.5">
-                            {task.completed ? (
+                            {isTaskCompleted ? (
                               <CheckCircle size={16} className="text-emerald-500" />
                             ) : (
                               <Clock size={16} className="text-brand-primary" />
                             )}
                           </div>
                           <div>
-                            <p className={`text-xs font-bold ${task.completed ? 'text-text-sec line-through' : 'text-text-main'}`}>
+                            <p className={`text-xs font-bold ${isTaskCompleted ? 'text-text-sec line-through' : 'text-text-main'}`}>
                               {task.title}
                             </p>
                             {task.project && (
@@ -2829,7 +2849,8 @@ export default function ProjectManagement() {
                           </button>
                         </div>
                       </div>
-                    ))}
+                    );
+                    })}
                   </div>
                 )}
               </div>
